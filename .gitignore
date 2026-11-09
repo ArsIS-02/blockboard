@@ -1,0 +1,3 @@
+blockboard.env
+*.db
+__pycache__/

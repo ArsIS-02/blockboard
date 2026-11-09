@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход — BlockBoard</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+:root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--line:#d2d2d7;--accent:#e67e35;--bad:#d92d20}
+@media(prefers-color-scheme:dark){:root{--bg:#161617;--card:#1f1f21;--text:#f5f5f7;--muted:#98989d;--line:#3a3a3c}}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,"SF Pro Text","Segoe UI",Roboto,sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:36px;width:min(380px,92vw);text-align:center}
+.card img{width:56px;height:56px;margin-bottom:10px}
+h1{font-size:22px;font-weight:600;margin-bottom:4px}
+p.sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+input{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:10px;
+  padding:11px 14px;font:inherit;margin-bottom:12px}
+input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+button{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:11px;
+  font:inherit;font-weight:600;cursor:pointer}
+button:hover{filter:brightness(1.08)}
+.err{color:var(--bad);font-size:13px;margin-top:12px;min-height:18px}
+</style>
+</head>
+<body>
+<div class="card">
+  <img src="/logo.svg" alt="BlockBoard">
+  <h1>BlockBoard</h1>
+  <p class="sub">Пульт блокировки индикаторов компрометации</p>
+  <form id="f">
+    <input name="user" placeholder="Логин" autocomplete="username" required autofocus>
+    <input name="password" type="password" placeholder="Пароль" autocomplete="current-password" required>
+    <button type="submit">Войти</button>
+  </form>
+  <div class="err" id="err"></div>
+</div>
+<script>
+document.getElementById("f").onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  const r = await fetch("/api/login", {method:"POST", headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({user:f.user.value, password:f.password.value})});
+  const d = await r.json();
+  if (d.ok) location.href = "/";
+  else document.getElementById("err").textContent = d.error || "ошибка входа";
+};
+</script>
+</body>
+</html>

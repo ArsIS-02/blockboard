@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlockBoard — пульт блокировок IOC</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+:root{
+  --bg:#f5f5f7; --card:#ffffff; --text:#1d1d1f; --muted:#6e6e73;
+  --line:#d2d2d7; --accent:#e67e35; --ok:#30a46c; --bad:#d92d20;
+  --chip:#ececef; --input:#f5f5f7;
+}
+html[data-theme="dark"]{
+  --bg:#161617; --card:#1f1f21; --text:#f5f5f7; --muted:#98989d;
+  --line:#3a3a3c; --accent:#e67e35; --ok:#3dd68c; --bad:#ff6b61;
+  --chip:#2c2c2e; --input:#2c2c2e;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,"SF Pro Text","Segoe UI",Roboto,sans-serif;min-height:100vh}
+a{color:var(--accent);text-decoration:none}
+header{display:flex;align-items:center;gap:12px;padding:14px 24px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+header img{width:30px;height:30px}
+header h1{font-size:18px;font-weight:600}
+.mode{margin-left:auto;font-size:12px;padding:3px 10px;border-radius:999px;background:var(--chip);color:var(--muted)}
+.mode.live{background:rgba(48,164,108,.15);color:var(--ok)}
+.mode.dry{background:rgba(217,45,32,.12);color:var(--bad)}
+.iconbtn{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:10px;padding:6px 12px;cursor:pointer;font-size:13px}
+.iconbtn:hover{border-color:var(--accent)}
+main{max-width:1080px;margin:0 auto;padding:24px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:20px}
+.card h2{font-size:16px;margin-bottom:14px}
+form.add{display:grid;grid-template-columns:2fr 1fr 2fr auto;gap:10px}
+input,select,textarea{background:var(--input);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:9px 12px;font:inherit;width:100%}
+input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.btn{background:var(--accent);color:#fff;border:none;border-radius:10px;padding:9px 18px;font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn:hover{filter:brightness(1.08)}
+.btn.ghost{background:var(--chip);color:var(--text);font-weight:500;padding:6px 12px;font-size:13px}
+.btn.danger{background:rgba(217,45,32,.12);color:var(--bad);font-weight:600;padding:6px 12px;font-size:13px}
+table{width:100%;border-collapse:collapse}
+th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:6px;background:var(--chip);color:var(--muted)}
+.tag.ip{background:rgba(230,126,53,.15);color:var(--accent)}
+.tag.domain{background:rgba(0,113,227,.13);color:#0a84ff}
+.st{font-size:12px;color:var(--muted)}
+.st.err{color:var(--bad)}
+.empty{color:var(--muted);text-align:center;padding:28px 0}
+.muted{color:var(--muted);font-size:13px}
+.hist td{font-size:13px;color:var(--muted)}
+dialog{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:16px;padding:24px;width:min(440px,92vw)}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog h3{margin-bottom:14px}
+dialog label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+.rowbtns{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 18px;border-radius:12px;font-size:14px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:99}
+.toast.show{opacity:.95}
+@media(max-width:760px){form.add{grid-template-columns:1fr}th:nth-child(4),td:nth-child(4){display:none}}
+</style>
+</head>
+<body>
+<header>
+  <img src="/logo.svg" alt="BlockBoard">
+  <h1>BlockBoard</h1>
+  <span class="mode" id="mode">…</span>
+  <button class="iconbtn" id="btnSettings" title="Настройки роутера">⚙ Настройки</button>
+  <button class="iconbtn" id="btnTheme" title="Тема">◐</button>
+  <button class="iconbtn" id="btnLogout">Выйти</button>
+</header>
+<main>
+  <section class="card">
+    <h2>Заблокировать индикатор</h2>
+    <form class="add" id="addForm">
+      <input name="indicator" placeholder="IP-адрес или домен, напр. 203.0.113.10" required autocomplete="off">
+      <select name="ttl">
+        <option value="1">на 1 час</option>
+        <option value="24" selected>на 24 часа</option>
+        <option value="72">на 3 суток</option>
+        <option value="168">на неделю</option>
+        <option value="">бессрочно</option>
+      </select>
+      <input name="reason" placeholder="Причина / источник (алерт Graylog, IOC…)" autocomplete="off">
+      <button class="btn" type="submit">Заблокировать</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Активные блокировки</h2>
+    <table id="blocks"><thead><tr>
+      <th>Индикатор</th><th>Причина</th><th>Создано</th><th>Истекает</th><th>Статус</th><th></th>
+    </tr></thead><tbody></tbody></table>
+    <div class="empty" id="blocksEmpty" hidden>Активных блокировок нет</div>
+  </section>
+
+  <section class="card">
+    <h2>Журнал действий</h2>
+    <table class="hist" id="history"><thead><tr>
+      <th>Время</th><th>Действие</th><th>Индикатор</th><th>Кем</th><th>Детали</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+</main>
+
+<dialog id="dlgSettings">
+  <h3>Подключение к Keenetic</h3>
+  <p class="muted">Пульт исполняет блокировки через RCI API роутера. Пока подключение не настроено, работает режим dry-run — действия только записываются в журнал.</p>
+  <form id="setForm">
+    <label>Режим</label>
+    <select name="mode"><option value="dryrun">dry-run (без роутера)</option><option value="keenetic">keenetic (боевой)</option></select>
+    <label>Адрес роутера</label>
+    <input name="router_host" placeholder="192.168.1.1">
+    <label>Логин администратора</label>
+    <input name="router_user" placeholder="admin">
+    <label>Пароль (хранится только в локальной БД сервиса)</label>
+    <input name="router_pass" type="password" placeholder="••••••••" autocomplete="new-password">
+    <div class="rowbtns">
+      <button type="button" class="btn ghost" id="btnTest">Проверить связь</button>
+      <button type="submit" class="btn">Сохранить</button>
+      <button type="button" class="btn ghost" onclick="dlgSettings.close()">Закрыть</button>
+    </div>
+    <p class="muted" id="testResult"></p>
+  </form>
+</dialog>
+
+<div class="toast" id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+const dlgSettings = $("#dlgSettings");
+const ACTION = {block:"блок", unblock:"разблок", expire:"снят по TTL", extend:"продлён", settings:"настройки"};
+
+// тема
+const savedTheme = localStorage.getItem("bb-theme");
+if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+$("#btnTheme").onclick = () => {
+  const t = document.documentElement.dataset.theme === "dark" ? "" : "dark";
+  document.documentElement.dataset.theme = t;
+  localStorage.setItem("bb-theme", t);
+};
+
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"), 2600); }
+function fmt(ts){ if(!ts) return "—";
+  return new Date(ts*1000).toLocaleString("ru-RU",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}); }
+async function api(path, body){
+  const r = await fetch(path, body!==undefined ? {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)} : {});
+  if (r.status === 401){ location.href="/login"; throw new Error("auth"); }
+  return r.json();
+}
+
+async function load(){
+  const d = await api("/api/blocks");
+  const m = $("#mode");
+  if (d.mode === "keenetic"){ m.textContent="● keenetic — боевой режим"; m.className="mode live"; }
+  else { m.textContent="○ dry-run — роутер не подключён"; m.className="mode dry"; }
+  const tb = $("#blocks tbody"); tb.innerHTML="";
+  $("#blocksEmpty").hidden = d.blocks.length>0;
+  for (const b of d.blocks){
+    const tr = document.createElement("tr");
+    const err = b.status.includes("error");
+    tr.innerHTML = `
+      <td><b>${esc(b.indicator)}</b> <span class="tag ${b.itype}">${b.itype==="ip"?"IP":"домен"}</span></td>
+      <td>${esc(b.reason)||'<span class="muted">—</span>'}${b.source?`<div class="st">${esc(b.source)}</div>`:""}</td>
+      <td class="st">${fmt(b.created)}</td>
+      <td class="st">${b.expires?fmt(b.expires):"бессрочно"}</td>
+      <td class="st ${err?"err":""}">${esc(b.executor_msg)}</td>
+      <td style="white-space:nowrap">
+        <button class="btn ghost" data-ext="${b.id}">+24ч</button>
+        <button class="btn danger" data-un="${b.id}">Снять</button>
+      </td>`;
+    tb.appendChild(tr);
+  }
+  const h = await api("/api/history");
+  const hb = $("#history tbody"); hb.innerHTML="";
+  for (const e of h.history){
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${fmt(e.ts)}</td><td>${ACTION[e.action]||esc(e.action)}</td>
+      <td>${esc(e.indicator)}</td><td>${esc(e.actor)}</td><td>${esc(e.detail)}</td>`;
+    hb.appendChild(tr);
+  }
+}
+function esc(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+$("#addForm").onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  const r = await api("/api/blocks", {indicator:f.indicator.value, ttl_hours:f.ttl.value?+f.ttl.value:null,
+    reason:f.reason.value, source:document.referrer&&document.referrer.includes("graylog")?"graylog":""});
+  if (r.ok){ toast("Заблокировано: "+r.executor_msg); f.indicator.value=""; f.reason.value=""; load(); }
+  else toast("Ошибка: "+(r.error||r.executor_msg));
+};
+
+$("#blocks").onclick = async e => {
+  const un = e.target.dataset.un, ext = e.target.dataset.ext;
+  if (un){ const r = await api(`/api/blocks/${un}/unblock`, {}); toast(r.executor_msg||r.error); load(); }
+  if (ext){ await api(`/api/blocks/${ext}/extend`, {hours:24}); toast("Продлено на 24 часа"); load(); }
+};
+
+$("#btnSettings").onclick = async () => {
+  const s = await api("/api/settings");
+  const f = $("#setForm");
+  f.mode.value = s.mode; f.router_host.value = s.router_host; f.router_user.value = s.router_user;
+  f.router_pass.placeholder = s.router_pass_set ? "•••••••• (уже задан)" : "не задан";
+  $("#testResult").textContent = "";
+  dlgSettings.showModal();
+};
+$("#setForm").onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {mode:f.mode.value, router_host:f.router_host.value, router_user:f.router_user.value};
+  if (f.router_pass.value) body.router_pass = f.router_pass.value;
+  await api("/api/settings", body);
+  toast("Настройки сохранены"); dlgSettings.close(); load();
+};
+$("#btnTest").onclick = async () => {
+  const f = $("#setForm");
+  if (f.router_pass.value) await api("/api/settings", {router_pass:f.router_pass.value,
+    router_host:f.router_host.value, router_user:f.router_user.value});
+  $("#testResult").textContent = "Проверяю…";
+  const r = await api("/api/test-router", {});
+  $("#testResult").textContent = r.ok ? "✓ Связь есть: "+r.router : "✗ "+r.error;
+};
+
+$("#btnLogout").onclick = async () => { await api("/api/logout", {}); location.href="/login"; };
+
+// предзаполнение из ссылки вида /?block=1.2.3.4&reason=...
+const pre = "__PREFILL_IND__", preReason = "__PREFILL_REASON__";
+if (pre && !pre.startsWith("__")){ $("#addForm").indicator.value = pre; $("#addForm").reason.value = preReason; $("#addForm").indicator.focus(); }
+
+load(); setInterval(load, 30000);
+</script>
+</body>
+</html>
