@@ -49,6 +49,16 @@ tr:last-child td{border-bottom:none}
 .empty{color:var(--muted);text-align:center;padding:28px 0}
 .muted{color:var(--muted);font-size:13px}
 .hist td{font-size:13px;color:var(--muted)}
+.geobar{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)}
+.geobar:last-child{border-bottom:none}
+.geobar .flag{font-size:18px;width:26px;text-align:center}
+.geobar .nm{width:170px;font-size:14px;flex-shrink:0}
+.geobar .bar{flex:1;background:var(--chip);border-radius:6px;height:14px;overflow:hidden}
+.geobar .bar>i{display:block;height:100%;background:var(--accent);border-radius:6px}
+.geobar .cnt{width:52px;text-align:right;font-weight:600;font-size:14px}
+.geobar .cities{width:100%;font-size:12px;color:var(--muted)}
+.geo-grid{display:grid;grid-template-columns:1.2fr 1fr;gap:24px}
+@media(max-width:860px){.geo-grid{grid-template-columns:1fr}}
 dialog{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:16px;padding:24px;width:min(440px,92vw)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
 dialog h3{margin-bottom:14px}
@@ -91,6 +101,18 @@ dialog label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
       <th>Индикатор</th><th>Причина</th><th>Создано</th><th>Истекает</th><th>Статус</th><th></th>
     </tr></thead><tbody></tbody></table>
     <div class="empty" id="blocksEmpty" hidden>Активных блокировок нет</div>
+  </section>
+
+  <section class="card">
+    <h2>География блокировок
+      <select id="geoDays" style="width:auto;display:inline-block;margin-left:10px;padding:4px 8px;font-size:13px">
+        <option value="7">за 7 дней</option>
+        <option value="30" selected>за 30 дней</option>
+        <option value="90">за 90 дней</option>
+      </select>
+    </h2>
+    <div class="muted" id="geoSummary">Загрузка…</div>
+    <div id="geoBody" style="margin-top:12px"></div>
   </section>
 
   <section class="card">
@@ -180,6 +202,43 @@ async function load(){
 }
 function esc(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
+// ---- география блокировок
+const CC_RU = {US:"США",CN:"Китай",HK:"Гонконг",RU:"Россия",DE:"Германия",NL:"Нидерланды",
+  GB:"Великобритания",FR:"Франция",SG:"Сингапур",JP:"Япония",KR:"Корея",IN:"Индия",BR:"Бразилия",
+  UA:"Украина",PL:"Польша",CZ:"Чехия",TR:"Турция",IR:"Иран",KP:"КНДР",VN:"Вьетнам",ID:"Индонезия",
+  AU:"Австралия",CA:"Канада",SE:"Швеция",CH:"Швейцария",FI:"Финляндия",NO:"Норвегия",IT:"Италия",
+  ES:"Испания",RO:"Румыния",BG:"Болгария",LT:"Литва",LV:"Латвия",EE:"Эстония",KZ:"Казахстан",
+  BY:"Беларусь",AM:"Армения",GE:"Грузия",AZ:"Азербайджан",MD:"Молдова",IL:"Израиль",ZA:"ЮАР",
+  TW:"Тайвань",TH:"Таиланд",MY:"Малайзия",PH:"Филиппины",AR:"Аргентина",MX:"Мексика",CO:"Колумбия"};
+function flag(cc){ if(!/^[A-Z]{2}$/.test(cc)) return "🏳";
+  return String.fromCodePoint(...[...cc].map(c=>0x1F1E6+c.charCodeAt(0)-65)); }
+async function loadGeo(){
+  const days = $("#geoDays").value;
+  const box = $("#geoBody"), sum = $("#geoSummary");
+  let d;
+  try { d = await api("/api/geo-stats?days="+days); }
+  catch(e){ sum.textContent = "Не удалось загрузить статистику"; box.innerHTML=""; return; }
+  if (!d.ok){ sum.textContent = "Гео-статистика недоступна: "+esc(d.error||"");
+    box.innerHTML=""; return; }
+  sum.innerHTML = `Всего блокировок за ${d.days} дн.: <b>${d.total}</b>` +
+    (d.no_geo ? ` · без гео-метки: ${d.no_geo} <span title="Домены и старые записи без GeoIP-обогащения">ⓘ</span>` : "");
+  if (!d.countries.length){ box.innerHTML = '<div class="empty">Записей с гео-меткой нет</div>'; return; }
+  const max = d.countries[0].count;
+  const rows = d.countries.slice(0,12).map(c => `
+    <div class="geobar">
+      <span class="flag">${flag(c.code)}</span>
+      <span class="nm">${esc(CC_RU[c.code]||c.code)}</span>
+      <span class="bar"><i style="width:${Math.max(3,Math.round(100*c.count/max))}%"></i></span>
+      <span class="cnt">${c.count}</span>
+      <span class="cities">${c.cities.map(([ci,n])=>esc(ci)+" ("+n+")").join(", ")}</span>
+    </div>`).join("");
+  const reasons = d.reasons.slice(0,8).map(([r,n]) =>
+    `<div class="geobar"><span class="nm" style="width:auto;flex:1">${esc(r)}</span><span class="cnt">${n}</span></div>`).join("");
+  box.innerHTML = `<div class="geo-grid"><div>${rows}</div>
+    <div><h3 style="font-size:13px;color:var(--muted);margin-bottom:8px">Топ причин</h3>${reasons}</div></div>`;
+}
+$("#geoDays").onchange = loadGeo;
+
 $("#addForm").onsubmit = async e => {
   e.preventDefault();
   const f = e.target;
@@ -226,7 +285,7 @@ $("#btnLogout").onclick = async () => { await api("/api/logout", {}); location.h
 const pre = "__PREFILL_IND__", preReason = "__PREFILL_REASON__";
 if (pre && !pre.startsWith("__")){ $("#addForm").indicator.value = pre; $("#addForm").reason.value = preReason; $("#addForm").indicator.focus(); }
 
-load(); setInterval(load, 30000);
+load(); loadGeo(); setInterval(load, 30000); setInterval(loadGeo, 300000);
 </script>
 </body>
 </html>

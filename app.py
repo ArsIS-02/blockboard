@@ -22,8 +22,8 @@
 
 ENV: BB_PORT (8098), BB_USER, BB_PASS, BB_DB, GELF_HOST, GELF_PORT
 """
-import base64, gzip, hashlib, ipaddress, json, os, re, secrets, socket, sqlite3
-import ssl, threading, time, urllib.request, urllib.error
+import base64, csv, gzip, hashlib, io, ipaddress, json, os, re, secrets, socket, sqlite3
+import ssl, threading, time, urllib.request, urllib.error, urllib.parse
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -80,6 +80,58 @@ def set_setting(con, key, value):
                 (key, value))
 
 # ---------------------------------------------------------------- Graylog
+
+GL_API = os.environ.get("BB_GRAYLOG_API", "https://graylog.apps.monitoring.test/api")
+GL_USER = os.environ.get("BB_GRAYLOG_USER", "")
+GL_PASS = os.environ.get("BB_GRAYLOG_PASS", "")
+
+
+def geo_stats(days: int = 30) -> dict:
+    """Агрегация блокировок по странам/городам/причинам из журнала Graylog.
+
+    Гео-поля (indicator_country_code, indicator_city_name) добавляет
+    GeoIP-пайплайн Graylog на событиях tool:blockboard — читаем их оттуда.
+    """
+    if not (GL_USER and GL_PASS):
+        return {"ok": False, "error": "не заданы BB_GRAYLOG_USER/BB_GRAYLOG_PASS"}
+    days = max(1, min(days, 365))
+    fields = "timestamp,action,indicator,reason,source,indicator_country_code,indicator_city_name"
+    q = urllib.parse.quote("tool:blockboard AND action:block")
+    url = (f"{GL_API}/search/universal/relative?query={q}"
+           f"&range={days * 86400}&limit=10000&fields={fields}")
+    req = urllib.request.Request(url)
+    tok = base64.b64encode(f"{GL_USER}:{GL_PASS}".encode()).decode()
+    req.add_header("Authorization", f"Basic {tok}")
+    req.add_header("X-Requested-By", "blockboard")
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=CTX) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        return {"ok": False, "error": f"Graylog API: {e}"}
+    countries: dict[str, dict] = {}
+    reasons: dict[str, int] = {}
+    total = no_geo = 0
+    for row in csv.DictReader(io.StringIO(raw)):
+        total += 1
+        cc = (row.get("indicator_country_code") or "").strip().upper()
+        reason = (row.get("reason") or "").strip() or "—"
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if not cc:
+            no_geo += 1
+            continue
+        c = countries.setdefault(cc, {"count": 0, "cities": {}})
+        c["count"] += 1
+        city = (row.get("indicator_city_name") or "").strip()
+        if city and city != "N/A":
+            c["cities"][city] = c["cities"].get(city, 0) + 1
+    out_countries = [
+        {"code": cc, "count": c["count"],
+         "cities": sorted(c["cities"].items(), key=lambda kv: -kv[1])[:5]}
+        for cc, c in sorted(countries.items(), key=lambda kv: -kv[1]["count"])]
+    return {"ok": True, "days": days, "total": total, "no_geo": no_geo,
+            "countries": out_countries,
+            "reasons": sorted(reasons.items(), key=lambda kv: -kv[1])[:10]}
+
 
 def send_gelf(short, level=5, **fields):
     try:
@@ -428,6 +480,13 @@ class Handler(BaseHTTPRequestHandler):
             rows = con.execute("SELECT * FROM history ORDER BY ts DESC LIMIT 200").fetchall()
             con.close()
             self._json({"history": [dict(r) for r in rows]})
+        elif p == "/api/geo-stats":
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                days = int(qs.get("days", ["30"])[0])
+            except ValueError:
+                days = 30
+            self._json(geo_stats(days))
         elif p == "/api/settings":
             con = db()
             self._json({"mode": get_setting(con, "mode", "dryrun"),
