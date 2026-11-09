@@ -78,3 +78,17 @@ GELF_PORT=12206
 
 GELF UDP, поля: `tool=blockboard`, `action=block|unblock|expire`,
 `indicator`, `itype`, `reason`, `result`, `ttl_hours`.
+
+## FeedPipe — автоблокировка из фидов IOC
+
+`feedpipe.py` — конвейер «TrafficLens → BlockBoard»: читает базу IOC
+TrafficLens (SQLite), отбирает IP/домены с confidence ≥ `FP_MIN_CONF`
+(по умолчанию 80) и блокирует их через API BlockBoard с TTL
+(`FP_TTL_HOURS`, по умолчанию 168 ч). Мёртвые C2 (Feodo «offline»),
+приватные/служебные адреса и локальные домены пропускаются.
+Дедупликация — на стороне BlockBoard, поэтому скрипт идемпотентен;
+за один прогон добавляется не более `FP_MAX_PER_RUN` (50) блокировок.
+
+Запуск по таймеру (`~/.config/systemd/user/feedpipe.{service,timer}`,
+каждый час в :17), учётка и параметры — в `~/blockboard/feedpipe.env`.
+Проверка без изменений: `FP_DRY=1 python3 feedpipe.py`.
