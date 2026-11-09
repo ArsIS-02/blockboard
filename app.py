@@ -141,7 +141,7 @@ class Keenetic:
             cookie = m.group(1)
         if not challenge or not realm or not cookie:
             raise KeeneticError("роутер не вернул challenge/realm (это точно Keenetic?)")
-        md5 = hashlib.md5((self.user + realm + self.password).encode()).hexdigest()
+        md5 = hashlib.md5(f"{self.user}:{realm}:{self.password}".encode()).hexdigest()
         digest = hashlib.sha256((challenge + md5).encode()).hexdigest()
         self.cookie = cookie
         status, headers, _ = self._req("/auth", {"login": self.user, "password": digest})
@@ -153,31 +153,103 @@ class Keenetic:
         status, _, body = self._req("/rci/", list(commands))
         if status != 200:
             raise KeeneticError(f"RCI вернул HTTP {status}: {body[:200]!r}")
-        return json.loads(body or b"[]")
+        result = json.loads(body or b"[]")
+        errors = []
+        def walk(o):
+            if isinstance(o, dict):
+                if o.get("status") == "error":
+                    errors.append(o.get("message", "?"))
+                for v in o.values():
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+        walk(result)
+        if errors:
+            raise KeeneticError("; ".join(errors)[:300])
+        return result
+
+    def get(self, path):
+        self.auth()
+        status, _, body = self._req(path)
+        if status != 200:
+            raise KeeneticError(f"GET {path}: HTTP {status}")
+        return json.loads(body or b"{}")
 
     def show_version(self):
         r = self.rci({"show": {"version": {}}})
-        v = r[0] if r else {}
-        return f"{v.get('model', '?')} · NDMS {v.get('release', v.get('version', '?'))}"
+        v = (r[0] if r else {}).get("show", {}).get("version", {})
+        return f"NDMS {v.get('title', '?')} (релиз {v.get('release', '?')})"
 
-    def block_ip(self, ip):
-        self.rci({"ip": {"route": {"host": ip, "mask": "255.255.255.255",
-                                    "reject": True, "description": "blockboard"}}},
-                  {"system": {"configuration": {"save": True}}})
+    # ---- ACL BlockBoard на файрволе (интерфейс Bridge0, направление in) ----
 
-    def unblock_ip(self, ip):
-        self.rci({"no": {"ip": {"route": {"host": ip, "mask": "255.255.255.255",
-                                           "reject": True}}}},
-                  {"system": {"configuration": {"save": True}}})
+    ACL = "BlockBoard"
+    LAN_IFACE = "Bridge0"
+
+    def _acl_rules(self):
+        """Текущие правила ACL BlockBoard на роутере."""
+        try:
+            rules = self.get("/rci/access-list")
+        except KeeneticError:
+            return []
+        return [r for r in rules
+                if r.get("acl") == self.ACL and "action" in r]
+
+    @staticmethod
+    def _rule(indicator, action="deny", no=False):
+        r = {"acl": Keenetic.ACL, "action": action, "protocol": "ip",
+             "source": "0.0.0.0", "source-mask": "0.0.0.0",
+             "destination": indicator,
+             "destination-mask": "255.255.255.255" if indicator != "0.0.0.0" else "0.0.0.0"}
+        if no:
+            r["no"] = True
+        return r
+
+    def _running_config(self):
+        self.auth()
+        status, _, body = self._req("/ci/running-config.txt")
+        if status != 200:
+            raise KeeneticError(f"running-config: HTTP {status}")
+        return body.decode(errors="replace")
+
+    def _ensure_attached(self):
+        cfg = self._running_config()
+        i = cfg.find(f"interface {self.LAN_IFACE}")
+        if i < 0:
+            raise KeeneticError(f"интерфейс {self.LAN_IFACE} не найден на роутере")
+        block = cfg[i:cfg.find("\n!", i) if cfg.find("\n!", i) > 0 else len(cfg)]
+        if f"ip access-group {self.ACL} in" not in block:
+            self.rci({"interface": {self.LAN_IFACE: {"ip": {"access-group":
+                          [{"acl": self.ACL, "direction": "in"}]}}}})
+
+    def reconcile_acl(self, ips):
+        """Пересобирает ACL из списка активных IP: deny-правила, затем permit-all.
+
+        Порядок критичен: роутер дописывает новые правила в конец,
+        поэтому ACL каждый раз пересоздаётся целиком."""
+        self._ensure_attached()
+        cmds = []
+        for r in self._acl_rules():
+            cmds.append({"access-list": [{
+                "acl": self.ACL, "action": r["action"], "protocol": r["protocol"],
+                "source": r["source"], "source-mask": r["source-mask"],
+                "destination": r["destination"],
+                "destination-mask": r["destination-mask"], "no": True}]})
+        for ip in sorted(ips):
+            cmds.append({"access-list": [self._rule(ip)]})
+        cmds.append({"access-list": [self._rule("0.0.0.0", "permit")]})
+        cmds.append({"system": {"configuration": {"save": {}}}})
+        self.rci(*cmds)
+
+    # ---- домены: статические DNS-записи 0.0.0.0 ----
 
     def block_domain(self, domain):
-        # статическая DNS-запись: роутер отвечает 0.0.0.0 всем клиентам сети
-        self.rci({"ip": {"host": {"name": domain, "address": "0.0.0.0"}}},
-                  {"system": {"configuration": {"save": True}}})
+        self.rci({"ip": {"host": {"domain": domain, "address": "0.0.0.0"}}},
+                  {"system": {"configuration": {"save": {}}}})
 
     def unblock_domain(self, domain):
-        self.rci({"no": {"ip": {"host": {"name": domain}}}},
-                  {"system": {"configuration": {"save": True}}})
+        self.rci({"ip": {"host": {"domain": domain, "no": True}}},
+                  {"system": {"configuration": {"save": {}}}})
 
 
 def detect_type(indicator):
@@ -209,31 +281,38 @@ def get_executor(con):
 
 
 def apply_block(con, indicator, itype):
+    """Блокировка. Для IP вызывать ПОСЛЕ записи в БД — ACL строится из БД."""
     k, mode = get_executor(con)
     if not k:
         return True, "dry-run: действие записано, роутер не подключён"
     try:
-        if itype == "ip":
-            k.block_ip(indicator)
-        else:
+        if itype == "domain":
             k.block_domain(indicator)
-        return True, f"keenetic: {indicator} заблокирован"
+            return True, f"keenetic: {indicator} → 0.0.0.0 (DNS)"
+        return sync_router_acl(con, k)
     except KeeneticError as e:
         return False, f"keenetic: ошибка — {e}"
 
 
 def apply_unblock(con, indicator, itype):
+    """Снятие блокировки. Для IP вызывать ПОСЛЕ обновления БД."""
     k, mode = get_executor(con)
     if not k:
         return True, "dry-run: действие записано, роутер не подключён"
     try:
-        if itype == "ip":
-            k.unblock_ip(indicator)
-        else:
+        if itype == "domain":
             k.unblock_domain(indicator)
-        return True, f"keenetic: {indicator} разблокирован"
+            return True, f"keenetic: {indicator} разблокирован (DNS)"
+        return sync_router_acl(con, k)
     except KeeneticError as e:
         return False, f"keenetic: ошибка — {e}"
+
+
+def sync_router_acl(con, k):
+    ips = [r["indicator"] for r in con.execute(
+        "SELECT indicator FROM blocks WHERE active=1 AND itype='ip'").fetchall()]
+    k.reconcile_acl(ips)
+    return True, f"keenetic: ACL обновлён, активных IP-блокировок: {len(ips)}"
 
 # ---------------------------------------------------------------- фон: снятие по TTL
 
@@ -245,14 +324,25 @@ def sweeper():
             now = time.time()
             rows = con.execute("SELECT * FROM blocks WHERE active=1 AND expires IS NOT NULL "
                                "AND expires<?", (now,)).fetchall()
-            for r in rows:
-                ok, msg = apply_unblock(con, r["indicator"], r["itype"])
-                con.execute("UPDATE blocks SET active=0, status=?, executor_msg=? WHERE id=?",
-                            ("expired" if ok else "expire-error", msg, r["id"]))
-                log_history(con, "expire", r["indicator"], "blockboard", msg)
-                send_gelf(f"BlockBoard: снят блок по TTL — {r['indicator']}",
-                          indicator=r["indicator"], action="expire", result=msg)
-            con.commit()
+            if rows:
+                for r in rows:
+                    con.execute("UPDATE blocks SET active=0, status='expired' WHERE id=?", (r["id"],))
+                con.commit()
+                # сначала домены (индивидуально), потом один reconcile ACL для IP
+                k, mode = get_executor(con)
+                for r in rows:
+                    if r["itype"] == "domain":
+                        ok, msg = apply_unblock(con, r["indicator"], r["itype"])
+                    else:
+                        ok, msg = (apply_unblock(con, r["indicator"], r["itype"])
+                                   if mode != "dryrun" else
+                                   (True, "dry-run: действие записано, роутер не подключён"))
+                    con.execute("UPDATE blocks SET status=?, executor_msg=? WHERE id=?",
+                                ("expired" if ok else "expire-error", msg, r["id"]))
+                    log_history(con, "expire", r["indicator"], "blockboard", msg)
+                    send_gelf(f"BlockBoard: снят блок по TTL — {r['indicator']}",
+                              indicator=r["indicator"], action="expire", result=msg)
+                con.commit()
             con.close()
         except Exception:
             pass
@@ -384,15 +474,16 @@ class Handler(BaseHTTPRequestHandler):
                 con.close()
                 return self._json({"ok": False, "error": "уже в активных блокировках"}, 409)
             expires = time.time() + float(ttl) * 3600 if ttl else None
-            ok, msg = apply_block(con, indicator, itype)
             cur = con.execute(
                 "INSERT INTO blocks(indicator,itype,reason,source,created,expires,active,status,executor_msg) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
-                (indicator, itype, reason, source, time.time(), expires,
-                 1 if ok else 0, "active" if ok else "error", msg))
+                "VALUES(?,?,?,?,?,?,1,'pending','')",
+                (indicator, itype, reason, source, time.time(), expires))
+            bid = cur.lastrowid
+            ok, msg = apply_block(con, indicator, itype)
+            con.execute("UPDATE blocks SET active=?, status=?, executor_msg=? WHERE id=?",
+                        (1 if ok else 0, "active" if ok else "error", msg, bid))
             log_history(con, "block", indicator, BB_USER, f"{reason} | {msg}")
             con.commit()
-            bid = cur.lastrowid
             con.close()
             send_gelf(f"BlockBoard: заблокирован {indicator}", level=4,
                       indicator=indicator, itype=itype, reason=reason,
@@ -405,9 +496,11 @@ class Handler(BaseHTTPRequestHandler):
             if not r:
                 con.close()
                 return self._json({"ok": False, "error": "блокировка не найдена"}, 404)
+            con.execute("UPDATE blocks SET active=0, status='removing' WHERE id=?", (bid,))
+            con.commit()
             ok, msg = apply_unblock(con, r["indicator"], r["itype"])
-            con.execute("UPDATE blocks SET active=0, status=?, executor_msg=? WHERE id=?",
-                        ("removed" if ok else "remove-error", msg, bid))
+            con.execute("UPDATE blocks SET status=?, executor_msg=?, active=? WHERE id=?",
+                        ("removed" if ok else "remove-error", msg, 0 if ok else 1, bid))
             log_history(con, "unblock", r["indicator"], BB_USER, msg)
             con.commit()
             con.close()
@@ -482,6 +575,16 @@ Handler._cookie = _login_with_cookie
 
 def main():
     threading.Thread(target=sweeper, daemon=True).start()
+    # при старте приводим роутер в соответствие с БД (если режим keenetic)
+    try:
+        con = db()
+        k, mode = get_executor(con)
+        if k:
+            ok, msg = sync_router_acl(con, k)
+            print(f"startup reconcile: {msg}")
+        con.close()
+    except Exception as e:
+        print(f"startup reconcile failed: {e}")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"BlockBoard слушает :{PORT}")
     srv.serve_forever()
