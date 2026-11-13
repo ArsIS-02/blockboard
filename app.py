@@ -165,6 +165,7 @@ class Keenetic:
         self.base = f"http://{host}"
         self.user, self.password, self.timeout = user, password, timeout
         self.cookie = None
+        self._auth_lock = threading.Lock()
 
     def _req(self, path, data=None, method=None):
         url = self.base + path
@@ -182,6 +183,10 @@ class Keenetic:
             raise KeeneticError(f"роутер недоступен: {e}")
 
     def auth(self):
+        with self._auth_lock:
+            self._auth()
+
+    def _auth(self):
         status, headers, _ = self._req("/auth")
         if status == 200:
             return  # уже авторизованы
@@ -345,7 +350,14 @@ def detect_type(indicator):
 
 
 def get_executor(con):
-    """Возвращает (callable_block, callable_unblock, mode_label) или None для dry-run."""
+    """Возвращает (клиент Keenetic, mode) или (None, 'dryrun').
+
+    Клиент кешируется на уровне процесса: иначе КАЖДАЯ операция
+    (блокировка домена/IP, reconcile) открывала новую RCI-сессию,
+    и роутер писал «admin вошёл в веб-конфигуратор» на каждый вызов —
+    десятки входов в час при прогонах feedpipe. С переиспользованием
+    сессии вход один, пока сессия жива (при истечении auth() сам
+    перелогинится по challenge)."""
     mode = get_setting(con, "mode", "dryrun")
     if mode == "keenetic":
         host = get_setting(con, "router_host")
@@ -356,9 +368,17 @@ def get_executor(con):
         except Exception:
             pw = ""
         if host and pw:
+            key = (host, user, pw)
+            if _EXECUTOR_CACHE["key"] == key and _EXECUTOR_CACHE["client"]:
+                return _EXECUTOR_CACHE["client"], "keenetic"
             k = Keenetic(host, user, pw)
+            _EXECUTOR_CACHE["key"] = key
+            _EXECUTOR_CACHE["client"] = k
             return k, "keenetic"
     return None, "dryrun"
+
+
+_EXECUTOR_CACHE = {"key": None, "client": None}
 
 
 def apply_block(con, indicator, itype, save=True):
