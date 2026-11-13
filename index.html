@@ -243,7 +243,7 @@ $("#addForm").onsubmit = async e => {
   e.preventDefault();
   const f = e.target;
   const r = await api("/api/blocks", {indicator:f.indicator.value, ttl_hours:f.ttl.value?+f.ttl.value:null,
-    reason:f.reason.value, source:document.referrer&&document.referrer.includes("graylog")?"graylog":""});
+    reason:f.reason.value, source:document.referrer&&document.referrer.includes("graylog")?"graylog":"", save:true});
   if (r.ok){ toast("Заблокировано: "+r.executor_msg); f.indicator.value=""; f.reason.value=""; load(); }
   else toast("Ошибка: "+(r.error||r.executor_msg));
 };

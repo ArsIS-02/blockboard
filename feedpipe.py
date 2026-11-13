@@ -112,11 +112,13 @@ class BB:
                 return e.code, json.loads(e.read() or b"{}")
             except Exception:
                 return e.code, {}
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            return 0, {"error": f"BlockBoard недоступен: {e}"}
 
     def login(self):
         st, r = self._req("/api/login", {"user": BB_USER, "password": BB_PASS})
         if st != 200:
-            raise SystemExit(f"feedpipe: вход в BlockBoard не удался (HTTP {st})")
+            raise SystemExit(f"feedpipe: вход в BlockBoard не удался (HTTP {st}): {r.get('error', '')}")
 
     def active(self):
         st, r = self._req("/api/blocks")

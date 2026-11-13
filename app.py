@@ -24,6 +24,7 @@ ENV: BB_PORT (8098), BB_USER, BB_PASS, BB_DB, GELF_HOST, GELF_PORT
 """
 import base64, csv, gzip, hashlib, io, ipaddress, json, os, re, secrets, socket, sqlite3
 import ssl, threading, time, urllib.request, urllib.error, urllib.parse
+from datetime import datetime, timezone, timedelta
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -160,7 +161,7 @@ class KeeneticError(Exception):
 class Keenetic:
     """RCI-клиент Keenetic NDMS (x-ndw2-interactive auth)."""
 
-    def __init__(self, host, user, password, timeout=10):
+    def __init__(self, host, user, password, timeout=30):
         self.base = f"http://{host}"
         self.user, self.password, self.timeout = user, password, timeout
         self.cookie = None
@@ -274,11 +275,13 @@ class Keenetic:
             self.rci({"interface": {self.LAN_IFACE: {"ip": {"access-group":
                           [{"acl": self.ACL, "direction": "in"}]}}}})
 
-    def reconcile_acl(self, ips):
+    def reconcile_acl(self, ips, save=True):
         """Пересобирает ACL из списка активных IP: deny-правила, затем permit-all.
 
         Порядок критичен: роутер дописывает новые правила в конец,
-        поэтому ACL каждый раз пересоздаётся целиком."""
+        поэтому ACL каждый раз пересоздаётся целиком.
+        save=False — не сохранять startup-config (для автоматических
+        синхронизаций, чтобы не шуметь «configuration saved» в syslog)."""
         self._ensure_attached()
         cmds = []
         for r in self._acl_rules():
@@ -290,18 +293,44 @@ class Keenetic:
         for ip in sorted(ips):
             cmds.append({"access-list": [self._rule(ip)]})
         cmds.append({"access-list": [self._rule("0.0.0.0", "permit")]})
-        cmds.append({"system": {"configuration": {"save": {}}}})
+        if save:
+            cmds.append({"system": {"configuration": {"save": {}}}})
         self.rci(*cmds)
+
+    def save_config(self):
+        """Явное сохранение startup-config на роутере."""
+        self.rci({"system": {"configuration": {"save": {}}}})
 
     # ---- домены: статические DNS-записи 0.0.0.0 ----
 
-    def block_domain(self, domain):
-        self.rci({"ip": {"host": {"domain": domain, "address": "0.0.0.0"}}},
-                  {"system": {"configuration": {"save": {}}}})
+    def block_domain(self, domain, save=True):
+        cmds = [{"ip": {"host": {"domain": domain, "address": "0.0.0.0"}}}]
+        if save:
+            cmds.append({"system": {"configuration": {"save": {}}}})
+        self.rci(*cmds)
 
-    def unblock_domain(self, domain):
-        self.rci({"ip": {"host": {"domain": domain, "no": True}}},
-                  {"system": {"configuration": {"save": {}}}})
+    def unblock_domain(self, domain, save=True):
+        cmds = [{"ip": {"host": {"domain": domain, "no": True}}}]
+        if save:
+            cmds.append({"system": {"configuration": {"save": {}}}})
+        self.rci(*cmds)
+
+    def static_hosts(self):
+        """Текущие статические DNS-записи роутера: {domain: [address,...]}."""
+        try:
+            hosts = self.get("/rci/ip/host")
+        except KeeneticError:
+            return {}
+        out = {}
+        items = hosts if isinstance(hosts, list) else [hosts]
+        for h in items:
+            if not isinstance(h, dict):
+                continue
+            d = (h.get("domain") or "").strip().lower()
+            a = (h.get("address") or "").strip()
+            if d:
+                out.setdefault(d, []).append(a)
+        return out
 
 
 def detect_type(indicator):
@@ -332,41 +361,95 @@ def get_executor(con):
     return None, "dryrun"
 
 
-def apply_block(con, indicator, itype):
-    """Блокировка. Для IP вызывать ПОСЛЕ записи в БД — ACL строится из БД."""
+def apply_block(con, indicator, itype, save=True):
+    """Блокировка. Для IP вызывать ПОСЛЕ записи в БД — ACL строится из БД.
+    save=False — изменения действуют до перезагрузки роутера, но не пишутся
+    в startup-config (автоматические прогоны feedpipe: 50 доменов за раз =
+    50 «configuration saved» в syslog). Персистентность даёт дневной
+    reconcile в sweeper()."""
     k, mode = get_executor(con)
     if not k:
         return True, "dry-run: действие записано, роутер не подключён"
     try:
         if itype == "domain":
-            k.block_domain(indicator)
+            k.block_domain(indicator, save=save)
             return True, f"keenetic: {indicator} → 0.0.0.0 (DNS)"
-        return sync_router_acl(con, k)
+        return sync_router_acl(con, k, save=save)
     except KeeneticError as e:
         return False, f"keenetic: ошибка — {e}"
 
 
-def apply_unblock(con, indicator, itype):
+def apply_unblock(con, indicator, itype, save=True):
     """Снятие блокировки. Для IP вызывать ПОСЛЕ обновления БД."""
     k, mode = get_executor(con)
     if not k:
         return True, "dry-run: действие записано, роутер не подключён"
     try:
         if itype == "domain":
-            k.unblock_domain(indicator)
+            k.unblock_domain(indicator, save=save)
             return True, f"keenetic: {indicator} разблокирован (DNS)"
-        return sync_router_acl(con, k)
+        return sync_router_acl(con, k, save=save)
     except KeeneticError as e:
         return False, f"keenetic: ошибка — {e}"
 
 
-def sync_router_acl(con, k):
+def sync_router_acl(con, k, save=True):
     ips = [r["indicator"] for r in con.execute(
         "SELECT indicator FROM blocks WHERE active=1 AND itype='ip'").fetchall()]
-    k.reconcile_acl(ips)
+    k.reconcile_acl(ips, save=save)
     return True, f"keenetic: ACL обновлён, активных IP-блокировок: {len(ips)}"
 
+
+def reconcile_domains(con, k):
+    """Полное согласование доменов: догоняет DNS-записи роутера до БД.
+
+    Добавляет записи для активных блокировок, которых нет на роутере
+    (например, созданных без save до перезагрузки), и убирает записи
+    0.0.0.0 для доменов, которых уже нет в активных. Возвращает сводку."""
+    active = {r["indicator"] for r in con.execute(
+        "SELECT indicator FROM blocks WHERE active=1 AND itype='domain'").fetchall()}
+    current = k.static_hosts()
+    added = removed = 0
+    for d in sorted(active):
+        if "0.0.0.0" not in current.get(d, []):
+            k.block_domain(d, save=False)
+            added += 1
+    for d, addrs in current.items():
+        if d not in active and addrs and all(a == "0.0.0.0" for a in addrs):
+            k.unblock_domain(d, save=False)
+            removed += 1
+    return added, removed
+
 # ---------------------------------------------------------------- фон: снятие по TTL
+
+YEKT = timezone(timedelta(hours=5))          # Asia/Yekaterinburg, без DST
+DAILY_SAVE_MINUTES = range(17, 28)           # окно 04:17–04:27 местного
+_daily_save_state = {"day": None}            # дата последнего дневного сохранения
+
+
+def daily_reconcile(con):
+    """Раз в сутки (04:17–04:27 по Екатеринбургу): полное согласование роутера
+    с БД (домены + IP-ACL) и ОДНО сохранение startup-config.
+
+    Именно этот save делает персистентными автоматические блокировки feedpipe,
+    которые применяются без save. Один save в день вместо ~50 в час."""
+    k, mode = get_executor(con)
+    if not k:
+        return
+    try:
+        added, removed = reconcile_domains(con, k)
+        ok, msg = sync_router_acl(con, k, save=False)
+        k.save_config()
+        detail = f"домены +{added}/-{removed}; {msg}"
+        log_history(con, "daily-save", "-", "blockboard", detail)
+        send_gelf("BlockBoard: дневное согласование и сохранение конфигурации",
+                  action="daily-save", result=detail)
+        print(f"daily reconcile: {detail}")
+    except KeeneticError as e:
+        log_history(con, "daily-save", "-", "blockboard", f"ошибка: {e}")
+        send_gelf(f"BlockBoard: ошибка дневного сохранения — {e}", level=3,
+                  action="daily-save", result=str(e))
+
 
 def sweeper():
     while True:
@@ -381,12 +464,13 @@ def sweeper():
                     con.execute("UPDATE blocks SET active=0, status='expired' WHERE id=?", (r["id"],))
                 con.commit()
                 # сначала домены (индивидуально), потом один reconcile ACL для IP
+                # save=False: снятия по TTL — автоматические, не пишем startup-config
                 k, mode = get_executor(con)
                 for r in rows:
                     if r["itype"] == "domain":
-                        ok, msg = apply_unblock(con, r["indicator"], r["itype"])
+                        ok, msg = apply_unblock(con, r["indicator"], r["itype"], save=False)
                     else:
-                        ok, msg = (apply_unblock(con, r["indicator"], r["itype"])
+                        ok, msg = (apply_unblock(con, r["indicator"], r["itype"], save=False)
                                    if mode != "dryrun" else
                                    (True, "dry-run: действие записано, роутер не подключён"))
                     con.execute("UPDATE blocks SET status=?, executor_msg=? WHERE id=?",
@@ -395,6 +479,12 @@ def sweeper():
                     send_gelf(f"BlockBoard: снят блок по TTL — {r['indicator']}",
                               indicator=r["indicator"], action="expire", result=msg)
                 con.commit()
+            # дневное окно: согласование + единственное сохранение конфигурации
+            now_yekt = datetime.now(YEKT)
+            if (now_yekt.hour == 4 and now_yekt.minute in DAILY_SAVE_MINUTES
+                    and _daily_save_state["day"] != now_yekt.date()):
+                _daily_save_state["day"] = now_yekt.date()
+                daily_reconcile(con)
             con.close()
         except Exception:
             pass
@@ -538,7 +628,9 @@ class Handler(BaseHTTPRequestHandler):
                 "VALUES(?,?,?,?,?,?,1,'pending','')",
                 (indicator, itype, reason, source, time.time(), expires))
             bid = cur.lastrowid
-            ok, msg = apply_block(con, indicator, itype)
+            # save=True только при ручном действии из панели (клиент шлёт "save": true);
+            # автоматические вызовы (feedpipe) не сохраняют startup-config на каждый домен
+            ok, msg = apply_block(con, indicator, itype, save=bool(b.get("save")))
             con.execute("UPDATE blocks SET active=?, status=?, executor_msg=? WHERE id=?",
                         (1 if ok else 0, "active" if ok else "error", msg, bid))
             log_history(con, "block", indicator, BB_USER, f"{reason} | {msg}")
