@@ -726,13 +726,15 @@ Handler._cookie = _login_with_cookie
 
 def main():
     threading.Thread(target=sweeper, daemon=True).start()
-    # при старте приводим роутер в соответствие с БД (если режим keenetic)
+    # при старте приводим роутер в соответствие с БД (если режим keenetic):
+    # полное согласование доменов + IP-ACL и одно сохранение startup-config
     try:
         con = db()
         k, mode = get_executor(con)
         if k:
-            ok, msg = sync_router_acl(con, k)
-            print(f"startup reconcile: {msg}")
+            added, removed = reconcile_domains(con, k)
+            ok, msg = sync_router_acl(con, k, save=True)
+            print(f"startup reconcile: домены +{added}/-{removed}; {msg}")
         con.close()
     except Exception as e:
         print(f"startup reconcile failed: {e}")
