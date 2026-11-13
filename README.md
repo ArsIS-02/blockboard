@@ -76,7 +76,7 @@ GELF_PORT=12206
 |---|---|---|
 | POST | `/api/login` | вход `{user, password}` |
 | GET | `/api/blocks` | активные блокировки |
-| POST | `/api/blocks` | новая `{indicator, reason, source, ttl_hours}` |
+| POST | `/api/blocks` | новая `{indicator, reason, source, ttl_hours, save}` (`save: true` — записать startup-config сразу; по умолчанию выкл.) |
 | POST | `/api/blocks/<id>/unblock` | снять блокировку |
 | POST | `/api/blocks/<id>/extend` | продлить `{hours}` |
 | GET | `/api/history` | журнал |
@@ -86,8 +86,36 @@ GELF_PORT=12206
 
 ## События в Graylog
 
-GELF UDP, поля: `tool=blockboard`, `action=block|unblock|expire`,
+GELF UDP, поля: `tool=blockboard`, `action=block|unblock|expire|daily-save`,
 `indicator`, `itype`, `reason`, `result`, `ttl_hours`.
+
+## Политика сохранения конфигурации Keenetic
+
+Каждая RCI-команда `system configuration save` пишет startup-config и
+порождает syslog-сообщение `StartupConfig: configuration saved`. Чтобы
+автоматика не генерировала десятки таких сообщений в час (и не дёргала
+правило Graylog «KEENETIC - Сохранена конфигурация роутера»), применяется
+разделение:
+
+- **Ручные действия из панели** (блокировка/разблокировка) — немедленный
+  save, событие Graylog и уведомление работают как прежде.
+- **Автоматика** (feedpipe, снятие блокировок по TTL) — изменения действуют
+  сразу, но startup-config **не пишется** (`save=False`).
+- **Дневное согласование**: фоновый поток sweeper раз в сутки в окне
+  **04:17–04:27 (Asia/Yekaterinburg)** выполняет полное согласование
+  роутера с БД (догоняет DNS-записи доменов, пересобирает IP-ACL) и делает
+  **одно** сохранение конфигурации.
+
+Компромисс: если роутер перезагрузится до дневного окна, автоматические
+блокировки последних часов вернутся только при ближайшем согласовании
+(или при рестарте сервиса — при старте выполняется reconcile ACL с save).
+
+На стороне Graylog дневное сохранение помечается pipeline-правилом
+«keenetic: mark autosave window» (поле `kn_autosave=true` для сообщений
+`StartupConfig: configuration saved` в окне 04:15–04:28 по Екатеринбургу),
+а в запрос правила «KEENETIC - Сохранена конфигурация роутера» добавлено
+исключение `AND NOT kn_autosave:true` — автосохранение не создаёт событий
+и уведомлений (в т.ч. эскалации в IRIS).
 
 ## FeedPipe — автоблокировка из фидов IOC
 
