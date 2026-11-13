@@ -499,6 +499,15 @@ def sweeper():
                     send_gelf(f"BlockBoard: снят блок по TTL — {r['indicator']}",
                               indicator=r["indicator"], action="expire", result=msg)
                 con.commit()
+            # keepalive RCI-сессии: лёгкий запрос раз в минуту не даёт сессии
+            # протухнуть по бездействию — иначе каждый час (feedpipe) роутер
+            # писал бы новый вход «admin в веб-конфигуратор»
+            k, mode = get_executor(con)
+            if k:
+                try:
+                    k.get("/rci/show/version")
+                except KeeneticError:
+                    _EXECUTOR_CACHE["client"] = None  # перелогин при следующем вызове
             # дневное окно: согласование + единственное сохранение конфигурации
             now_yekt = datetime.now(YEKT)
             if (now_yekt.hour == 4 and now_yekt.minute in DAILY_SAVE_MINUTES
