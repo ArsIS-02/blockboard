@@ -51,7 +51,9 @@ DOMAIN_RE = re.compile(r"^([a-z0-9](-?[a-z0-9])*\.)+[a-z]{2,}$", re.I)
 
 def db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     con.row_factory = sqlite3.Row
     con.execute("""CREATE TABLE IF NOT EXISTS blocks(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
